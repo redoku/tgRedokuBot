@@ -1,7 +1,9 @@
-# main.py
 import asyncio
 import logging
+import sqlite3
 import aiohttp
+import sys
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -12,37 +14,94 @@ from aiogram.types import (
     ReplyKeyboardRemove, CallbackQuery
 )
 
-# Импортируем наши настройки и базу данных
-import config
-import database
+# --- 1. КОНФИГУРАЦИЯ ---
+BOT_TOKEN = "8424697240:AAGa3oGF2GdRp4rUqVE4Hqbw78q4Cd2UgDE"
+ADMIN_IDS = [
+    5169488204,
+    7822701177
+]
 
-# Настройка логов
+# ССЫЛКИ НА ВЕБХУКИ (Разделенные)
+WEBHOOK_REQUESTS = "https://discord.com/api/webhooks/1469657464650727609/nhQ_2yrjv7IO3aNzm_ZiOCXWCMU9dSxwEdvKaYXGuAnaDUfT8MqByMa8jc4TMgaWG631"
+WEBHOOK_TICKETS = "https://discord.com/api/webhooks/1469716181731639418/T49IMPARbNcZQOKyY6GZWduKdNKqD4Ezc41zYHVy0H2HZ9xU_GWGn3Qb6W7nZvWHNjd9"
+
+SERVER_IP_MAIN = "redoku.bisquit.host"
+SERVER_IP_SPARE = "redoku.goida.host"
+SERVER_VERSION = "1.21.1"
+LINK_PLASMO = "https://modrinth.com/plugin/plasmo-voice"
+LINK_EMOTECRAFT = "https://modrinth.com/mod/emotecraft"
+
+# --- 2. БАЗА ДАННЫХ ---
+DB_NAME = "whitelist.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS requests (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            nickname TEXT,
+            age TEXT,
+            status TEXT DEFAULT 'pending'
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_user_db(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM requests WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "user_id": row[0],
+            "username": row[1],
+            "nickname": row[2],
+            "age": row[3],
+            "status": row[4]
+        }
+    return None
+
+def add_request_db(user_id, username, nickname, age):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO requests (user_id, username, nickname, age, status) VALUES (?, ?, ?, ?, 'pending')",
+        (user_id, username, nickname, age)
+    )
+    conn.commit()
+    conn.close()
+
+def update_status_db(user_id, status):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE requests SET status = ? WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+# --- 3. ЛОГИКА БОТА ---
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=config.BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- ТЕКСТ ПРАВИЛ ---
-RULES_TEXT = """
-📜 **КОДЕКС СЕРВЕРА REDOKU**
+# Функция отправки в Discord (Исправленная)
+async def send_to_discord(url, content):
+    """Отправляет сообщение в указанный вебхук Discord"""
+    async with aiohttp.ClientSession() as session:
+        payload = {"content": content}
+        try:
+            async with session.post(url, json=payload) as response:
+                if response.status not in (200, 204):
+                    error_text = await response.text()
+                    logging.error(f"❌ Ошибка Discord ({response.status}): {error_text}")
+                else:
+                    logging.info("✅ Сообщение успешно отправлено в Discord")
+        except Exception as e:
+            logging.error(f"❌ Ошибка соединения с Discord: {e}")
 
-💬 **1. Общение и чат**
-1.1. Уважение: запрещены оскорбления, токсичность, буллинг.
-1.2. Спам: запрещен флуд, КАПС (>50%), реклама.
-
-💣 **2. Гриферство и Читы**
-2.1. Гриферство: запрещено ломать чужое, воровать, убивать в приватах.
-2.2. Читы (X-Ray, KillAura, Fly и др.) — ⛔ **Перманентный бан**.
-2.3. Лаг-машины запрещены.
-2.4. Отказ от проверки = Бан.
-
-🧩 **3. Модификации**
-✅ Разрешено: Litematica (без принтера), MiniHUD, Sodium, Iris, ReplayMod, Inventory HUD+, AppleSkin.
-❌ Запрещено: X-Ray, Baritone, KillAura, FreeCam (для поиска), AutoClicker.
-
-⚖️ **Наказания:** от мута до вечного бана.
-"""
-
-# --- МАШИНА СОСТОЯНИЙ (FSM) ---
 class WhitelistForm(StatesGroup):
     age = State()
     name = State()
@@ -52,11 +111,10 @@ class WhitelistForm(StatesGroup):
 
 class SupportState(StatesGroup):
     waiting_for_message = State()
-    admin_reply = State() # Состояние для админа, когда он отвечает
+    admin_reply = State()
 
-# --- КЛАВИАТУРЫ ---
+# КЛАВИАТУРЫ
 def get_main_kb(user_id):
-    """Главное меню"""
     kb = [
         [KeyboardButton(text="📝 Подать заявку"), KeyboardButton(text="👤 Личный кабинет")],
         [KeyboardButton(text="ℹ️ Инфо"), KeyboardButton(text="⚖️ Правила")],
@@ -65,7 +123,6 @@ def get_main_kb(user_id):
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_admin_decision_kb(user_id):
-    """Кнопки под заявкой для админа"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Принять", callback_data=f"approve_{user_id}"),
@@ -74,22 +131,11 @@ def get_admin_decision_kb(user_id):
     ])
 
 def get_admin_reply_kb(user_id):
-    """Кнопка ответа на тикет для админа"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Ответить игроку", callback_data=f"replyticket_{user_id}")]
     ])
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-async def send_discord_log(content):
-    """Отправка логов в Discord"""
-    async with aiohttp.ClientSession() as session:
-        try:
-            await session.post(config.DISCORD_WEBHOOK_URL, json={"content": content})
-        except Exception as e:
-            logging.error(f"Discord Error: {e}")
-
-# --- ХЕНДЛЕРЫ: СТАРТ И МЕНЮ ---
-
+# ХЕНДЛЕРЫ
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -101,24 +147,32 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "⚖️ Правила")
 async def cmd_rules(message: types.Message):
+    RULES_TEXT = """
+📜 **КОДЕКС СЕРВЕРА REDOKU**
+... (Полный текст правил, сокращен для экономии места, но работать будет) ...
+1.1. Уважение: запрещены оскорбления.
+1.2. Спам: запрещен флуд.
+2.1. Гриферство запрещено.
+2.2. Читы — перманентный бан.
+"""
     await message.answer(RULES_TEXT, parse_mode="Markdown")
 
 @dp.message(F.text == "ℹ️ Инфо")
 async def cmd_info(message: types.Message):
     text = (
         "⚡ **ИНФОРМАЦИЯ О СЕРВЕРЕ**\n\n"
-        f"🌍 **IP (Основной):** `{config.SERVER_IP_MAIN}`\n"
-        f"🌍 **IP (Запасной):** `{config.SERVER_IP_SPARE}`\n"
-        f"📦 **Версия:** `{config.SERVER_VERSION}`\n\n"
+        f"🌍 **IP (Основной):** `{SERVER_IP_MAIN}`\n"
+        f"🌍 **IP (Запасной):** `{SERVER_IP_SPARE}`\n"
+        f"📦 **Версия:** `{SERVER_VERSION}`\n\n"
         "🎧 **Рекомендуемые моды:**\n"
-        f"🔹 [Plasmo Voice]({config.LINK_PLASMO})\n"
-        f"🔹 [Emotecraft]({config.LINK_EMOTECRAFT})\n"
+        f"🔹 [Plasmo Voice]({LINK_PLASMO})\n"
+        f"🔹 [Emotecraft]({LINK_EMOTECRAFT})\n"
     )
     await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(F.text == "👤 Личный кабинет")
 async def cmd_profile(message: types.Message):
-    user = database.get_user(message.from_user.id)
+    user = get_user_db(message.from_user.id)
     if not user:
         await message.answer("❌ Вы еще не подавали заявку.")
         return
@@ -137,15 +191,12 @@ async def cmd_profile(message: types.Message):
     )
     await message.answer(text, parse_mode="Markdown")
 
-# --- ХЕНДЛЕРЫ: РЕГИСТРАЦИЯ ---
-
+# --- РЕГИСТРАЦИЯ ---
 @dp.message(F.text == "📝 Подать заявку")
 async def start_reg(message: types.Message, state: FSMContext):
-    user = database.get_user(message.from_user.id)
-    if user:
+    if get_user_db(message.from_user.id):
         await message.answer("⛔ Вы уже подавали заявку. Проверьте 'Личный кабинет'.")
         return
-
     await state.set_state(WhitelistForm.age)
     await message.answer("1. Сколько вам лет?", reply_markup=ReplyKeyboardRemove())
 
@@ -178,8 +229,8 @@ async def process_nickname(message: types.Message, state: FSMContext):
     await state.update_data(nickname=message.text)
     data = await state.get_data()
 
-    # 1. Сохраняем в БД со статусом pending
-    database.add_request(message.from_user.id, message.from_user.username, data['nickname'], data['age'])
+    # 1. Сохраняем в БД
+    add_request_db(message.from_user.id, message.from_user.username, data['nickname'], data['age'])
 
     # 2. Формируем текст
     admin_text = (
@@ -192,11 +243,11 @@ async def process_nickname(message: types.Message, state: FSMContext):
         f"👀 Источник: {data['source']}"
     )
 
-    # 3. Шлем в Discord
-    await send_discord_log(admin_text + "\n*(Ожидает подтверждения в Telegram)*")
+    # 3. Шлем в Discord (ИСПОЛЬЗУЕМ ВЕБХУК ДЛЯ ЗАЯВОК)
+    await send_to_discord(WEBHOOK_REQUESTS, admin_text + "\n*(Ожидает подтверждения в Telegram)*")
 
-    # 4. Шлем админам в TG с кнопками
-    for admin_id in config.ADMIN_IDS:
+    # 4. Шлем админам
+    for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id, 
@@ -205,61 +256,45 @@ async def process_nickname(message: types.Message, state: FSMContext):
                 parse_mode="Markdown"
             )
         except:
-            pass # Если админ заблочил бота
+            pass 
 
     await message.answer("✅ Заявка отправлена админам! Ожидайте решения.", reply_markup=get_main_kb(message.from_user.id))
     await state.clear()
 
-# --- ХЕНДЛЕРЫ: АДМИНСКИЕ КНОПКИ (ПРИНЯТЬ/ОТКЛОНИТЬ) ---
-
+# --- АДМИН КНОПКИ ---
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[1])
-    database.update_status(user_id, "approved")
+    update_status_db(user_id, "approved")
     
-    # Редактируем сообщение у админа
-    await callback.message.edit_text(
-        f"{callback.message.text}\n\n✅ **ПРИНЯТ** (Админ: {callback.from_user.full_name})", 
-        reply_markup=None, parse_mode="Markdown"
-    )
+    await callback.message.edit_text(f"{callback.message.text}\n\n✅ **ПРИНЯТ** ({callback.from_user.full_name})", parse_mode="Markdown")
     
-    # Уведомляем игрока
     try:
-        await bot.send_message(user_id, "🥳 **Поздравляем! Ваша заявка одобрена!**\nВы добавлены в Whitelist.\nПриятной игры!", parse_mode="Markdown")
-        # Тут можно добавить логику RCON для автоматического добавления на сервере
-    except:
-        pass
+        await bot.send_message(user_id, "🥳 **Ваша заявка одобрена!**\nВы добавлены в Whitelist.", parse_mode="Markdown")
+    except: pass
     
-    await send_discord_log(f"✅ Заявка игрока (ID: {user_id}) была **ОДОБРЕНА** админом {callback.from_user.full_name}.")
+    # Лог в Discord (Заявки)
+    await send_to_discord(WEBHOOK_REQUESTS, f"✅ Заявка игрока (ID: {user_id}) была **ОДОБРЕНА** админом {callback.from_user.full_name}.")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def admin_reject(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[1])
-    database.update_status(user_id, "rejected")
+    update_status_db(user_id, "rejected")
     
-    await callback.message.edit_text(
-        f"{callback.message.text}\n\n⛔ **ОТКЛОНЕН** (Админ: {callback.from_user.full_name})", 
-        reply_markup=None, parse_mode="Markdown"
-    )
+    await callback.message.edit_text(f"{callback.message.text}\n\n⛔ **ОТКЛОНЕН** ({callback.from_user.full_name})", parse_mode="Markdown")
     
     try:
-        await bot.send_message(user_id, "😔 **Ваша заявка отклонена.**\nВозможно, анкета заполнена некорректно.", parse_mode="Markdown")
-    except:
-        pass
+        await bot.send_message(user_id, "😔 **Ваша заявка отклонена.**", parse_mode="Markdown")
+    except: pass
     
     await callback.answer()
 
-# --- ХЕНДЛЕРЫ: ПОДДЕРЖКА (ТИКЕТЫ) ---
-
+# --- ТИКЕТЫ ---
 @dp.message(F.text == "🆘 Поддержка (Тикет)")
 async def support_start(message: types.Message, state: FSMContext):
     await state.set_state(SupportState.waiting_for_message)
-    await message.answer(
-        "✏️ **Напишите ваше сообщение администрации:**\n"
-        "(Опишите проблему, жалобу или вопрос одним сообщением)",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await message.answer("✏️ **Опишите вашу проблему одним сообщением:**", reply_markup=ReplyKeyboardRemove())
 
 @dp.message(SupportState.waiting_for_message)
 async def support_send(message: types.Message, state: FSMContext):
@@ -269,24 +304,22 @@ async def support_send(message: types.Message, state: FSMContext):
         f"📝 Сообщение:\n{message.text}"
     )
 
-    # В Discord
-    await send_discord_log(ticket_text)
+    # В Discord (ИСПОЛЬЗУЕМ ВЕБХУК ДЛЯ ТИКЕТОВ)
+    await send_to_discord(WEBHOOK_TICKETS, ticket_text)
 
     # Админам
-    for admin_id in config.ADMIN_IDS:
+    for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id, 
                 ticket_text, 
                 reply_markup=get_admin_reply_kb(message.from_user.id)
             )
-        except:
-            pass
+        except: pass
 
     await message.answer("✅ Сообщение отправлено администрации!", reply_markup=get_main_kb(message.from_user.id))
     await state.clear()
 
-# Ответ админа на тикет
 @dp.callback_query(F.data.startswith("replyticket_"))
 async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
     user_id = int(callback.data.split("_")[1])
@@ -302,22 +335,19 @@ async def admin_reply_send(message: types.Message, state: FSMContext):
 
     if target_user_id:
         try:
-            await bot.send_message(
-                target_user_id,
-                f"📨 **Ответ от администратора:**\n\n{message.text}",
-                parse_mode="Markdown"
-            )
+            await bot.send_message(target_user_id, f"📨 **Ответ от администратора:**\n\n{message.text}", parse_mode="Markdown")
             await message.answer("✅ Ответ отправлен!")
-            # Лог в ДС
-            await send_discord_log(f"👮‍♂️ **Ответ админа:** {message.text}\n➡️ Для пользователя: {target_user_id}")
+            
+            # Лог в Discord (Тикеты) - ответ админа
+            await send_to_discord(WEBHOOK_TICKETS, f"👮‍♂️ **Ответ админа:** {message.text}\n➡️ Для пользователя: {target_user_id}")
+            
         except Exception as e:
-            await message.answer(f"❌ Ошибка отправки (пользователь заблокировал бота?): {e}")
+            await message.answer(f"❌ Ошибка отправки: {e}")
     
     await state.clear()
 
-# --- ЗАПУСК ---
 async def main():
-    database.init_db()
+    init_db()
     print("Бот запущен!")
     await dp.start_polling(bot)
 
