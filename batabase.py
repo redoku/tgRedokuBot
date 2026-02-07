@@ -57,4 +57,5 @@ def update_status(user_id, status):
     cursor = conn.cursor()
     cursor.execute("UPDATE requests SET status = ? WHERE user_id = ?", (status, user_id))
     conn.commit()
+
     conn.close()
