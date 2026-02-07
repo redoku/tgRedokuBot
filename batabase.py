@@ -59,3 +59,4 @@ def update_status(user_id, status):
     conn.commit()
 
     conn.close()
+
